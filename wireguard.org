@@ -1,0 +1,242 @@
+
+** Basic information
+#+name: Generating keys for local machine
+#+begin_src sh
+umask 077                                 # limit the rights to newly created files
+mkdir keys && cd keys                     # create directory with keys to use them later
+wg genkey > privatekey                    # generate private key
+cat privatekey | wg pubkey > publickey    # use private key to generate public key
+#+end_src
+
+*** Machines topology
+#+name: Topology
+#+begin_src text
+ Server                                                 Client
+┌────────────────────┐                            ┌─────────────────┐
+│                    │SERVER_IP:PORT     CLIENT_IP│                 │
+│                    │----------------------------│                 │
+│       SERVER_WG_IP │                            │ CLIENT_WG_IP    │
+│                ----│                            │----             │
+│SERVER_PUB_KEY      │                            │  CLIENT_PUB_KEY │
+│SERVER_PRIV_KEY     │                            │  CLIENT_PRIV_KEY│
+└────────────────────┘                            └─────────────────┘
+#+end_src
+
+=Server= is accessible from =Client= via ~${SERVER_IP}~.
+
+In our examples:
+- Public IP address and port of server
+  SERVER_IP:PORT => 100.100.100.100:44444
+
+- Local IP address of client
+  CLIENT_IP      => 10.20.30.1/24
+
+- VPN network.
+  Wireguard interfaces will have IP address within range 172.16.100.0/24
+  SERVER_WG_IP   => 172.16.100.1/24
+  CLIENT_WG_IP   => 172.16.100.2/24
+
+** Configuration with ~ip~ and ~wg~
+#+name: Wireguard configuration on Server
+#+begin_src conf
+[Interface]
+PivateKey = SERVER_PRIV_KEY
+ListenPort = 44444
+[Peer]
+PublicKey = CLIENT_PUB_KEY
+AllowedIPs = 172.16.100.2
+#+end_src
+
+#+name: Wireguard configuration on Client
+#+begin_src conf
+[Interface]
+PivateKey = CLIENT_PRIV_KEY
+[Peer]
+EndPoint = 100.100.100.100:44444
+PublicKey = SERVER_PUB_KEY
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+#+end_src
+
+Client for communication via Wireguard protocol will send UDP traffic to
+100.100.100.100:44444. Next block will assume that configration
+is saved in ~/etc/wireguard/wg0.conf~
+
+#+name: Interface configuration on Server
+#+begin_src bash
+ip link add dev wg0 type wireguard                 # create network interface
+ip address add 172.16.100.1/24 dev wg0             # add ip address to this interface
+ip link set wg0 up                                 # bring this interface up
+wg setconf wg0 /etc/wireguard/wg0.conf             # associate configuration in file
+                                                   # with specified network interface
+wg show                                            # show information about available connections
+#+end_src
+
+The same commands should be executed on Client.
+As a result VPN tunnel will be created. Machines will be able to ping each other
+via IP addresses configured on the ~wg0~ interfaces.
+
+Setting ~AllowedIPs~ restricts which IP addresses are allowed to be used for
+traffic that is going through the ~wg0~ interface. If packets do not satisfy
+the rule they will be dropped. We allow client to receive packets with all
+IP addresses from server to be able to communicate with any host in the Internet.
+
+** Basic configuration with ~quick-wg~. VPN for browsing.
+*** Server config
+#+name: /etc/wireguard/wg0.conf
+#+begin_src conf
+[Interface]
+Address = 172.16.100.1/24           # this address will be set to wg interface
+DNS = 1.1.1.1                       # DNS server for this interface (resolvconf)
+PrivateKey = SERVER_PRIV_KEY
+ListenPort = 44444
+
+# Setup. Actions to do after successfull service startup.
+PostUp = sysctl -w net.ipv4.ip_forward=1                                          # enable packets forwarding
+PostUp = iptables -I FORWARD 1 -s 172.16.100.0/24 -o ens3 -j ACCEPT               # allow forwarding traffic from client
+PostUp = iptables -I FORWARD 1 -d 172.16.100.0/24 -o wg -j ACCEPT                 # allow forwarding traffic to client
+PostUp = iptables -t nat -A POSTROUTING -s 172.16.100.0/24 -o ens3 -j MASQUERADE  # enable NAT
+
+# Cleanup. Action to do after disabling the wireguard.
+PostDown = sysctl -w net.ipv4.ip_forward=0                                          # disable packets forwarding
+PostDown = iptables -D FORWARD -s 172.16.100.0/24 -o ens3 -j ACCEPT                 # forbid forwarding traffic from client
+PostDown = iptables -D FORWARD -d 172.16.100.0/24 -o wg -j ACCEPT                   # forbid forwarding traffic to client
+PostDown = iptables -t nat -D POSTROUTING -s 172.16.100.0/24 -o ens3 -j MASQUERADE  # disable NAT
+
+[Peer]
+Publickey = CLIENT_PUB_KEY
+AllowedIPs = 172.16.100.2
+#+end_src
+
+#+name: Enable wireguard
+#+begin_src shell
+wg-quick up
+#+end_src
+
+This command will create the interface ~wg0~, assign address to it and apply
+configuration. After establising connection it will to ~PostUp~ actions
+one by one. If any ~PostUp~ action returns error then whole connection
+is bringing down.
+
+*** Client config
+#+name: /etc/wireguard/wg0.conf
+#+begin_src conf
+[Interface]
+Address = 172.16.100.2/24
+PivateKey = CLIENT_PRIV_KEY
+DNS = 1.1.1.1
+[Peer]
+EndPoint = 100.100.100.100:44444
+PublicKey = SERVER_PUB_KEY
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+#+end_src
+
+#+name: Enable wireguard
+#+begin_src shell
+wg-quick up
+#+end_src
+
+This command will create the interface ~wg0~, assign address to it and apply
+configuration. According to the ~AllowedIPs~ parameter all traffic will be
+forwarded to the interface.
+Next things will be done *automatically*:
+ - special marking rules are added to the ~mangle~ table of ~iptables~;
+ - new routing table is added and all marked packets will be forwarded to
+   this table;
+ - default route to the interface is added in this table.
+
+Specified DNS address will be used for resolving addressed on the client side.
+
+** Autostarting shell scripts with systemd
+#+name: systemd unit configuration
+#+path: /etc/systemd/system/wireguard@.service
+#+begin_src conf
+[Unit]
+Description=Start wireguard tunnel to %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/wireguard/start-%i.sh # Put your configuration commands here
+ExecStop=/etc/wireguard/stop-%i.sh   # Put your shutdown commands here
+RemainAfterExit=yes                  # This is very necessary to leave service online
+
+[Install]
+WantedBy=multi-user.target
+#+end_src
+
+For =oneshot= services that just run scripts and do some configuration in them without
+starting any long living processes it is necessary to set ~RemainAfterExit=yes~.
+Without this configuration =systemd= sees that script just exitted and makes the
+conclusion that service failed to start. Then it will run rollback action in
+~ExecStop~ option and all our configuration will be ruined. Status of the service
+is =down= after all.
+
+~RemainAfterExit=yes~ makes systemctl think that finished command in ~ExecStart~ is a
+normal behavior.
+
+#+name: Run commands to start and enable autostart of service
+#+begin_src sh
+systemctl start wireguard@wg0.service
+systemctl enable wireguard@wg0.service
+#+end_src
+
+Value after =@= sign and before =.service= will be automatically substituted to =%i= in script.
+
+** Normal configuration with systemd
+*** Client configuration
+#+name: /etc/systemd/network/wg0.netdev
+#+begin_src conf
+[NetDev]
+Name = wg0
+Kind = wireguard
+Description = WireGuard client to Server
+
+[WireGuard]
+PrivateKey = CLIENT_PRIV_KEY
+FirewallMark=0x8888    # can be any of your choice
+
+[WireGuardPeer]
+Endpoint = 100.100.100.100:44444
+PublicKey = SERVER_PUB_KEY
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+#+end_src
+
+#+name: /etc/systemd/network/wg0.network
+#+begin_src conf
+[Match]
+Name = wg0
+
+[Network]
+Address = 172.16.101.2/24
+DNS = 1.1.1.1
+DNSDefaultRoute = true
+Domains = ~.
+
+[RoutingPolicyRule]
+To = 10.20.30.0/24
+Priority = 9
+
+[RoutingPolicyRule]
+FirewallMark = 0x8888
+InvertRule = true
+Table = 1000
+Priority = 10
+
+[Route]
+Gateway = 172.16.101.1
+GatewayOnlink = true
+Table = 1000
+#+end_src
+
+**** Commands to control
+#+begin_src shell
+systemctl daemon-reload   # read configuration from files
+networkctl wg0 up
+networkctl wg0 down
+networkctl status
+networkctl list
+#+end_src

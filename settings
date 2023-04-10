@@ -1,0 +1,12 @@
+sudo apt-get install mawk grep iproute2 qrencode iptables wireguard
+wget https://raw.githubusercontent.com/burghardt/easy-wg-quick/master/easy-wg-quick
+chmod +x easy-wg-quick
+./easy-wg-quick VDSina
+
+cat wgclient_VDSina.conf
+
+cp wghub.conf /etc/wireguard/wghub.conf
+systemctl enable wg-quick@wghub
+systemctl start wg-quick@wghub
+
+wg show
